@@ -1,0 +1,19 @@
+{
+  "name": "qrshare",
+  "version": "1.0.0",
+  "description": "Offline File Transfer via QR Codes only",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "cert": "./generate_certs.sh"
+  },
+  "keywords": [
+    "qr",
+    "file-transfer",
+    "offline",
+    "adler32",
+    "gzip"
+  ],
+  "author": "QRShare",
+  "license": "MIT"
+}

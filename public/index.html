@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>QRShare - Offline File Transfer via QR Codes</title>
+  <!-- Outfit Font for clean, premium typography -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  
+  <!-- Include local offline-capable libraries -->
+  <script src="libs/qrcode.min.js"></script>
+  <script src="libs/jsQR.js"></script>
+</head>
+<body>
+  <div class="stars-background"></div>
+  <div class="glow-container">
+    <div class="glow-spot spot-1"></div>
+    <div class="glow-spot spot-2"></div>
+  </div>
+
+  <div class="app-container">
+    <!-- Header -->
+    <header class="app-header">
+      <div class="logo-area">
+        <svg class="logo-icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M3 3H9V9H3V3ZM5 5V7H7V5H5Z" fill="currentColor"/>
+          <path d="M3 15H9V21H3V15ZM5 17V19H7V17H5Z" fill="currentColor"/>
+          <path d="M15 3H21V9H15V3ZM17 5V7H19V5H17Z" fill="currentColor"/>
+          <path d="M15 15H18V18H15V15ZM18 18H21V21H18V18ZM15 18H18V21H15V18ZM18 15H21V18H18V15Z" fill="currentColor"/>
+          <path d="M12 3H13V9H12V3ZM3 12H9V13H3V12ZM15 12H21V13H15V12ZM12 15H13V21H12V15Z" fill="currentColor"/>
+        </svg>
+        <span class="logo-text">QR<span>Share</span></span>
+      </div>
+      <div class="badge">v1.0 (Local Only)</div>
+    </header>
+
+    <!-- Main Card -->
+    <main class="main-card">
+      <!-- Mode Tabs (Visible on start screen) -->
+      <div class="tabs-navigation" id="mainTabs">
+        <button class="tab-btn active" data-target="sendSection">
+          <svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M22 2L11 13M22 2L15 22L11 13M11 13L2 9L22 2" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          Send File
+        </button>
+        <button class="tab-btn" data-target="receiveSection">
+          <svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          Receive File
+        </button>
+      </div>
+
+      <!-- Content Sections -->
+      <div class="sections-container">
+        
+        <!-- ================= SEND SECTION ================= -->
+        <section id="sendSection" class="section-content active">
+          <!-- File Dropzone -->
+          <div class="dropzone-container" id="dropzone">
+            <input type="file" id="fileInput" class="file-input-hidden">
+            <div class="dropzone-inner">
+              <div class="pulse-glow"></div>
+              <svg class="upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              <h3>Select or Drop File</h3>
+              <p class="dropzone-hint">Drag & drop your file here, or click to browse</p>
+              <p class="dropzone-limit">Recommended for files under 1 MB (images, pdfs, text, keys)</p>
+            </div>
+          </div>
+
+          <!-- File Configuration (Shown after selecting a file) -->
+          <div class="config-panel hidden" id="sendConfigPanel">
+            <div class="selected-file-card">
+              <div class="file-details">
+                <svg class="file-preview-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" stroke-linecap="round" stroke-linejoin="round"/>
+                  <polyline points="14 2 14 8 20 8" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+                <div class="file-meta">
+                  <div class="file-name" id="cfgFileName">filename.ext</div>
+                  <div class="file-info"><span id="cfgFileSize">0 KB</span> &bull; <span id="cfgFileType">Unknown type</span></div>
+                </div>
+              </div>
+              <button class="btn btn-secondary btn-icon-only" id="changeFileBtn" title="Choose another file">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M18 6L6 18M6 6l12 12" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+              </button>
+            </div>
+
+            <div class="settings-grid">
+              <div class="setting-item">
+                <div class="setting-label">
+                  <span>Transmission Speed (FPS)</span>
+                  <span class="setting-value" id="valFps">10 FPS</span>
+                </div>
+                <input type="range" id="inputFps" min="2" max="25" value="10" class="slider">
+                <div class="setting-desc">Frames per second. Lower values scan more reliably on older cameras.</div>
+              </div>
+
+              <div class="setting-item">
+                <div class="setting-label">
+                  <span>Chunk Size (Bytes)</span>
+                  <span class="setting-value" id="valChunkSize">250 bytes</span>
+                </div>
+                <input type="range" id="inputChunkSize" min="100" max="800" step="50" value="250" class="slider">
+                <div class="setting-desc">Size of data encoded in each QR code. Smaller chunks are easier to scan.</div>
+              </div>
+
+              <div class="setting-item checkbox-setting">
+                <div class="checkbox-container">
+                  <input type="checkbox" id="inputCompress" checked>
+                  <label for="inputCompress">
+                    <span class="checkbox-custom"></span>
+                    Compress File (Gzip)
+                  </label>
+                </div>
+                <div class="setting-desc" style="margin-top: 6px;">Significantly reduces the number of QR codes for compressible files.</div>
+              </div>
+            </div>
+
+            <button class="btn btn-primary btn-block btn-lg" id="startSendBtn">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:18px;height:18px;margin-right:8px;">
+                <polygon points="5 3 19 12 5 21 5 3" fill="currentColor"/>
+              </svg>
+              Generate QR Sequence & Start
+            </button>
+          </div>
+
+          <!-- Active Sending Screen -->
+          <div class="active-screen hidden" id="activeSendScreen">
+            <div class="card-title-bar">
+              <h4>Sending: <span class="file-name-truncate" id="activeSendTitle">file.zip</span></h4>
+              <div class="badge badge-pulse" id="sendLoopIndicator">Loop 1</div>
+            </div>
+
+            <div class="qr-display-wrapper">
+              <div class="qr-outer-border" id="qrBorder">
+                <!-- Glowing indicator corners that cycle colors/flashes to show frame progression -->
+                <div class="qr-sync-indicator" id="qrSyncIndicator"></div>
+                <div class="qr-canvas-container">
+                  <canvas id="qrCanvas"></canvas>
+                </div>
+              </div>
+            </div>
+
+            <!-- Playback controls -->
+            <div class="playback-controls">
+              <button class="btn btn-secondary btn-icon" id="prevChunkBtn" title="Previous Frame">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
+              </button>
+              
+              <button class="btn btn-primary btn-round" id="playPauseBtn" title="Play / Pause">
+                <svg id="playPauseIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <rect x="6" y="4" width="4" height="16" fill="currentColor"/><rect x="14" y="4" width="4" height="16" fill="currentColor"/>
+                </svg>
+              </button>
+              
+              <button class="btn btn-secondary btn-icon" id="nextChunkBtn" title="Next Frame">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
+              </button>
+            </div>
+
+            <!-- Progress stats -->
+            <div class="progress-details">
+              <div class="progress-info-row">
+                <span>Frame Progress</span>
+                <span id="txtSendProgress">0 / 0</span>
+              </div>
+              <div class="progress-bar-bg">
+                <div class="progress-bar-fill" id="sendProgressBar" style="width: 0%"></div>
+              </div>
+              
+              <div class="stats-grid">
+                <div class="stat-box">
+                  <div class="stat-lbl">Chunk Size</div>
+                  <div class="stat-val" id="statSendChunkSize">250 B</div>
+                </div>
+                <div class="stat-box">
+                  <div class="stat-lbl">Total Bytes</div>
+                  <div class="stat-val" id="statSendTotalBytes">0 B</div>
+                </div>
+                <div class="stat-box">
+                  <div class="stat-lbl">Speed</div>
+                  <div class="stat-val" id="statSendSpeed">10 FPS</div>
+                </div>
+                <div class="stat-box">
+                  <div class="stat-lbl">Est. Time</div>
+                  <div class="stat-val" id="statSendEstTime">0s</div>
+                </div>
+              </div>
+            </div>
+
+            <div class="button-group-row">
+              <button class="btn btn-outline" id="stopSendBtn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width: 14px; height: 14px; margin-right: 6px;">
+                  <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+                </svg>
+                Stop Sending
+              </button>
+            </div>
+          </div>
+        </section>
+
+        <!-- ================= RECEIVE SECTION ================= -->
+        <section id="receiveSection" class="section-content">
+          <!-- Initial Receiver Start Screen -->
+          <div class="receive-start" id="receiveStartScreen">
+            <div class="icon-circle">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
+                <circle cx="12" cy="13" r="4"/>
+              </svg>
+            </div>
+            <h3>Scan QR Sequence</h3>
+            <p class="receive-hint">Grant camera access to scan the sequential QR codes from another screen and reconstruct the shared file.</p>
+            <button class="btn btn-primary btn-lg" id="startCameraBtn">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:18px;height:18px;margin-right:8px;">
+                <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
+                <circle cx="12" cy="13" r="4"/>
+              </svg>
+              Access Camera & Start Scanning
+            </button>
+          </div>
+
+          <!-- Active Receiving Screen -->
+          <div class="active-screen hidden" id="activeReceiveScreen">
+            <div class="card-title-bar">
+              <h4>Receiving: <span class="file-name-truncate" id="activeReceiveTitle">Scanning for metadata...</span></h4>
+              <div class="badge" id="cameraStatus">Active</div>
+            </div>
+
+            <!-- Video feed container -->
+            <div class="camera-viewport-wrapper">
+              <div class="camera-viewport">
+                <video id="webcamVideo" autoplay playsinline muted></video>
+                <div class="camera-overlay">
+                  <div class="scan-target-box">
+                    <div class="corner tl"></div>
+                    <div class="corner tr"></div>
+                    <div class="corner bl"></div>
+                    <div class="corner br"></div>
+                    <div class="scanning-line"></div>
+                  </div>
+                </div>
+              </div>
+              
+              <!-- Camera Selector -->
+              <div class="camera-select-row">
+                <label for="cameraSelect">Camera:</label>
+                <select id="cameraSelect" class="form-select">
+                  <option value="">Default Camera</option>
+                </select>
+              </div>
+            </div>
+
+            <!-- Progress Statistics & Map -->
+            <div class="progress-details">
+              <div class="progress-info-row">
+                <span>Transferred Chunks</span>
+                <span id="txtReceiveProgress">0 / ? (0%)</span>
+              </div>
+              <div class="progress-bar-bg">
+                <div class="progress-bar-fill" id="receiveProgressBar" style="width: 0%"></div>
+              </div>
+
+              <!-- Graphical Chunk Map -->
+              <div class="chunk-map-wrapper">
+                <div class="chunk-map-header">
+                  <span>Defragmentation Map</span>
+                  <span class="chunk-map-legend">
+                    <span class="legend-item"><span class="block block-empty"></span> Missing</span>
+                    <span class="legend-item"><span class="block block-filled"></span> Received</span>
+                  </span>
+                </div>
+                <div class="chunk-grid" id="chunkGrid">
+                  <!-- Generated dynamically in app.js -->
+                  <div class="chunk-grid-placeholder">Waiting to scan first QR code...</div>
+                </div>
+              </div>
+
+              <div class="stats-grid">
+                <div class="stat-box">
+                  <div class="stat-lbl">File Size</div>
+                  <div class="stat-val" id="statRecvSize">-</div>
+                </div>
+                <div class="stat-box">
+                  <div class="stat-lbl">Received Chunks</div>
+                  <div class="stat-val" id="statRecvChunks">0 / 0</div>
+                </div>
+                <div class="stat-box">
+                  <div class="stat-lbl">Missing Chunks</div>
+                  <div class="stat-val" id="statRecvMissing">-</div>
+                </div>
+                <div class="stat-box">
+                  <div class="stat-lbl">File ID</div>
+                  <div class="stat-val" id="statRecvFileId">-</div>
+                </div>
+              </div>
+            </div>
+
+            <div class="button-group-row">
+              <button class="btn btn-outline" id="stopCameraBtn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width: 14px; height: 14px; margin-right: 6px;">
+                  <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+                </svg>
+                Cancel Scanning
+              </button>
+            </div>
+          </div>
+
+          <!-- Success Screen (File assembled) -->
+          <div class="receive-success-screen hidden" id="recvSuccessScreen">
+            <div class="success-glow">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="20 6 9 17 4 12"/>
+              </svg>
+            </div>
+            <h2>Transfer Complete!</h2>
+            <p class="success-subtitle">The file was successfully received, checksum verified, and assembled.</p>
+
+            <div class="success-file-card">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="success-file-icon">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                <polyline points="14 2 14 8 20 8"/>
+              </svg>
+              <div class="success-file-details">
+                <div class="file-name" id="successFileName">file.png</div>
+                <div class="success-meta">
+                  <div class="meta-row"><span>Size:</span> <strong id="successFileSize">0 KB</strong></div>
+                  <div class="meta-row"><span>Type:</span> <strong id="successFileType">image/png</strong></div>
+                  <div class="meta-row"><span>Integrity:</span> <strong id="successFileHash" class="code-font">a1b2c3d4</strong></div>
+                </div>
+              </div>
+            </div>
+
+            <div class="success-actions">
+              <button class="btn btn-primary btn-lg btn-block" id="downloadFileBtn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:18px;height:18px;margin-right:8px;">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+                Download File
+              </button>
+              <button class="btn btn-secondary btn-block" id="resetRecvBtn">
+                Scan Another File
+              </button>
+            </div>
+          </div>
+        </section>
+
+      </div>
+    </main>
+
+    <!-- Footer / How it works -->
+    <footer class="app-footer">
+      <div class="accordion-info" id="infoAccordion">
+        <div class="accordion-header" id="accordionHeader">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width: 16px; height: 16px;">
+            <circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/>
+          </svg>
+          How does it work?
+          <svg class="accordion-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width: 14px; height: 14px; margin-left: auto;">
+            <polyline points="6 9 12 15 18 9"/>
+          </svg>
+        </div>
+        <div class="accordion-content" id="accordionContent">
+          <p>This web app works completely locally and offline. It doesn't upload your file to any server.</p>
+          <ol>
+            <li><strong>Encode:</strong> The sending device compresses the file and breaks it down into small chunks (200-300 bytes each). It wraps each chunk in a header containing the file details, sequence index, and checksum.</li>
+            <li><strong>Animate:</strong> It generates a sequence of QR codes, which it displays sequentially in a loop at high speeds (e.g., 10 frames per second).</li>
+            <li><strong>Scan:</strong> The receiving device uses its camera to scan these QR codes in any order. The visual sync indicator flashes on each frame transition to notify the camera when a new chunk is active.</li>
+            <li><strong>Assemble:</strong> The receiving browser populates the chunk grid, verifying the checksum for each piece. Once all chunks (including the metadata chunk) are collected, it merges the data, decompresses it (gzip), and initiates a download.</li>
+          </ol>
+        </div>
+      </div>
+      <p class="copyright">&copy; 2026 QRShare. Built with visual excellence.</p>
+    </footer>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
