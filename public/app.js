@@ -19,6 +19,7 @@ const senderState = {
   fps: DEFAULT_FPS,
   fileId: "",
   chunks: [],
+  preRenderedCanvases: [], // Cache for pre-rendered offscreen canvases
   intervalId: null,
   activeIndex: 0,
   isPlaying: false,
@@ -517,6 +518,38 @@ async function prepareAndStartTransmission() {
   const totalSeconds = Math.ceil(totalChunks / senderState.fps);
   DOM.statSendEstTime.textContent = `${totalSeconds}s`;
 
+  // Pre-render all QR codes onto offscreen canvases to ensure fluid, lag-free playback
+  senderState.preRenderedCanvases = [];
+  for (let i = 0; i < totalChunks; i++) {
+    DOM.startSendBtn.innerHTML = `
+      <svg class="animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:16px;height:16px;margin-right:8px;animation: spin 1s linear infinite;">
+        <circle cx="12" cy="12" r="10" stroke-opacity="0.25"/>
+        <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>
+      </svg>
+      Generating QR ${i + 1} / ${totalChunks}...
+    `;
+    
+    // Yield execution back to the browser to redraw the progress text
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    const offscreen = document.createElement('canvas');
+    await new Promise((resolve, reject) => {
+      QRCode.toCanvas(offscreen, senderState.chunks[i], {
+        width: 280,
+        margin: 1,
+        color: {
+          dark: '#000000',
+          light: '#ffffff'
+        },
+        errorCorrectionLevel: 'L'
+      }, (err) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+    senderState.preRenderedCanvases.push(offscreen);
+  }
+
   // Transition UI to sender screen
   DOM.sendConfigPanel.classList.add('hidden');
   DOM.activeSendScreen.classList.remove('hidden');
@@ -530,22 +563,14 @@ async function prepareAndStartTransmission() {
  * Render current active frame to the canvas
  */
 function renderSenderFrame() {
-  const frameText = senderState.chunks[senderState.activeIndex];
+  const activeCanvas = senderState.preRenderedCanvases[senderState.activeIndex];
+  if (!activeCanvas) return;
   
-  // Render using local QRCode library
-  QRCode.toCanvas(DOM.qrCanvas, frameText, {
-    width: 280,
-    margin: 1,
-    color: {
-      dark: '#000000',
-      light: '#ffffff'
-    },
-    errorCorrectionLevel: 'L' // Low is highly recommended for speed and detail density
-  }, (err) => {
-    if (err) {
-      console.error("QR Code rendering error:", err);
-    }
-  });
+  // Clear and copy the pre-rendered canvas onto the visible canvas instantly
+  const ctx = DOM.qrCanvas.getContext('2d');
+  DOM.qrCanvas.width = activeCanvas.width;
+  DOM.qrCanvas.height = activeCanvas.height;
+  ctx.drawImage(activeCanvas, 0, 0);
 
   // Cycle corners / sync indicator colors to show active frame change clearly
   const colors = ['#00f2fe', '#4facfe', '#b156ff', '#10b981', '#f59e0b', '#ef4444'];
@@ -605,6 +630,7 @@ function stopSending() {
   pauseSending();
   senderState.activeIndex = 0;
   senderState.chunks = [];
+  senderState.preRenderedCanvases = [];
   senderState.file = null;
   senderState.rawBuffer = null;
   senderState.dataBuffer = null;
