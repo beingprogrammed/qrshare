@@ -97,6 +97,7 @@ const DOM = {
   cameraStatus: document.getElementById('cameraStatus'),
   webcamVideo: document.getElementById('webcamVideo'),
   cameraSelect: document.getElementById('cameraSelect'),
+  scannerFeedback: document.getElementById('scannerFeedback'),
   txtReceiveProgress: document.getElementById('txtReceiveProgress'),
   receiveProgressBar: document.getElementById('receiveProgressBar'),
   chunkGrid: document.getElementById('chunkGrid'),
@@ -934,6 +935,9 @@ async function startReceiverCamera() {
     DOM.cameraStatus.textContent = "Active";
     DOM.cameraStatus.className = "badge badge-pulse";
     
+    DOM.scannerFeedback.textContent = "Camera active. Point at sender QR Code...";
+    DOM.scannerFeedback.style.color = "var(--color-primary)";
+
     // Start scan canvas loop
     if (receiverState.animationFrameId) {
       cancelAnimationFrame(receiverState.animationFrameId);
@@ -943,6 +947,8 @@ async function startReceiverCamera() {
     console.error("Error starting camera stream:", err);
     DOM.cameraStatus.textContent = "Error";
     DOM.cameraStatus.className = "badge";
+    DOM.scannerFeedback.textContent = "Camera initialization failed.";
+    DOM.scannerFeedback.style.color = "var(--color-danger)";
     alert("Unable to open selected camera source: " + err.message);
   }
 }
@@ -977,6 +983,9 @@ function resetReceiverState() {
   DOM.statRecvMissing.textContent = "-";
   DOM.statRecvFileId.textContent = "-";
   
+  DOM.scannerFeedback.textContent = "Ready to scan...";
+  DOM.scannerFeedback.style.color = "var(--color-primary)";
+
   DOM.chunkGrid.innerHTML = '<div class="chunk-grid-placeholder">Waiting to scan first QR code...</div>';
 }
 
@@ -989,19 +998,23 @@ const capCtx = capCanvas.getContext('2d', { willReadFrequently: true });
 function scanVideoFrame() {
   const video = DOM.webcamVideo;
   
-  if (video.readyState === video.HAVE_ENOUGH_DATA) {
-    // Fit canvas resolution to actual video source
-    capCanvas.width = video.videoWidth;
-    capCanvas.height = video.videoHeight;
-    
-    capCtx.drawImage(video, 0, 0, capCanvas.width, capCanvas.height);
-    const imgData = capCtx.getImageData(0, 0, capCanvas.width, capCanvas.height);
-    
-    // Decode with local jsQR library
-    const decoded = jsQR(imgData.data, imgData.width, imgData.height);
-    
-    if (decoded && decoded.data) {
-      handleFrameScanned(decoded.data);
+  if (video.readyState === video.HAVE_ENOUGH_DATA && video.videoWidth > 0 && video.videoHeight > 0) {
+    try {
+      // Fit canvas resolution to actual video source
+      capCanvas.width = video.videoWidth;
+      capCanvas.height = video.videoHeight;
+      
+      capCtx.drawImage(video, 0, 0, capCanvas.width, capCanvas.height);
+      const imgData = capCtx.getImageData(0, 0, capCanvas.width, capCanvas.height);
+      
+      // Decode with local jsQR library
+      const decoded = jsQR(imgData.data, imgData.width, imgData.height);
+      
+      if (decoded && decoded.data) {
+        handleFrameScanned(decoded.data);
+      }
+    } catch (err) {
+      console.error("Camera frame capture/decode crashed:", err);
     }
   }
 
@@ -1018,8 +1031,11 @@ function handleFrameScanned(dataStr) {
   // Protocol: MAGIC|Version|FileID|Flags|TotalChunks|Index|Base64Payload|Checksum
   const parts = dataStr.split('|');
   
-  if (parts.length !== 8) return; // not our QR code
-  if (parts[0] !== MAGIC_PREFIX || parts[1] !== PROTOCOL_VERSION) return; // version mismatch
+  if (parts.length !== 8 || parts[0] !== MAGIC_PREFIX || parts[1] !== PROTOCOL_VERSION) {
+    DOM.scannerFeedback.textContent = "Scanning... Unrecognized QR Code.";
+    DOM.scannerFeedback.style.color = "var(--color-warning)";
+    return;
+  }
 
   const fileId = parts[2];
   const isCompressed = parts[3] === "1";
@@ -1032,6 +1048,8 @@ function handleFrameScanned(dataStr) {
   const compChecksum = adler32(base64Data).toString(16).padStart(8, '0');
   if (compChecksum !== checksum) {
     console.warn(`Checksum mismatch on frame ${index}! Skipping.`);
+    DOM.scannerFeedback.textContent = `Corrupted frame ${index} (checksum error).`;
+    DOM.scannerFeedback.style.color = "var(--color-danger)";
     return;
   }
 
@@ -1071,6 +1089,11 @@ function handleFrameScanned(dataStr) {
       cell.classList.add('filled');
     }
 
+    // Update scanner feedback status
+    const chunkName = index === 0 ? "Metadata (0)" : `Data (${index}/${totalChunks - 1})`;
+    DOM.scannerFeedback.textContent = `Scanned Chunk ${chunkName} successfully!`;
+    DOM.scannerFeedback.style.color = "var(--color-success)";
+
     // Play successful sweep/beep
     playBeep('normal');
 
@@ -1101,6 +1124,10 @@ function handleFrameScanned(dataStr) {
     checkCompleteness();
   } else {
     // Duplicate chunk scanned (already parsed in this loop)
+    const chunkName = index === 0 ? "Metadata (0)" : `Data (${index}/${totalChunks - 1})`;
+    DOM.scannerFeedback.textContent = `Duplicate Chunk ${chunkName} (waiting for new...)`;
+    DOM.scannerFeedback.style.color = "var(--color-primary)";
+    
     // Play very silent tick so user knows scanner is still responsive
     playBeep('duplicate');
   }
