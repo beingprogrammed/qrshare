@@ -64,6 +64,12 @@ const DOM = {
   inputCompress: document.getElementById('inputCompress'),
   startSendBtn: document.getElementById('startSendBtn'),
 
+  // Loading Overlay
+  loadingOverlay: document.getElementById('loadingOverlay'),
+  loadingStatusText: document.getElementById('loadingStatusText'),
+  loadingProgressBar: document.getElementById('loadingProgressBar'),
+  loadingPercentageText: document.getElementById('loadingPercentageText'),
+
   // Active Send Screen
   activeSendScreen: document.getElementById('activeSendScreen'),
   activeSendTitle: document.getElementById('activeSendTitle'),
@@ -434,6 +440,7 @@ function initSendControls() {
     } catch (err) {
       console.error(err);
       alert("Error reading file: " + err.message);
+      DOM.loadingOverlay.classList.add('hidden');
       DOM.startSendBtn.disabled = false;
       DOM.startSendBtn.textContent = "Generate QR Sequence & Start";
     }
@@ -529,6 +536,12 @@ async function prepareAndStartTransmission() {
   senderState.loopCount = 1;
   DOM.sendLoopIndicator.textContent = `Loop 1`;
 
+  // Display and initialize loading overlay progress
+  DOM.loadingOverlay.classList.remove('hidden');
+  DOM.loadingStatusText.textContent = "Initializing file transfer...";
+  DOM.loadingProgressBar.style.width = '5%';
+  DOM.loadingPercentageText.textContent = '5%';
+
   const totalRawBytes = file.size;
   let totalDataBytes = totalRawBytes;
   
@@ -542,7 +555,12 @@ async function prepareAndStartTransmission() {
     senderState.rawBuffer = null;
     senderState.dataBuffer = null;
   } else {
-    // Read contents into memory only for files that support compression/caching
+    // Read contents into memory
+    DOM.loadingStatusText.textContent = "Reading file into memory...";
+    DOM.loadingProgressBar.style.width = '15%';
+    DOM.loadingPercentageText.textContent = '15%';
+    await new Promise(resolve => setTimeout(resolve, 50)); // let UI render
+
     const reader = new FileReader();
     const fileDataPromise = new Promise((resolve, reject) => {
       reader.onload = () => resolve(new Uint8Array(reader.result));
@@ -551,7 +569,15 @@ async function prepareAndStartTransmission() {
     reader.readAsArrayBuffer(file);
     senderState.rawBuffer = await fileDataPromise;
 
+    DOM.loadingProgressBar.style.width = '30%';
+    DOM.loadingPercentageText.textContent = '30%';
+
     if (senderState.isCompressed) {
+      DOM.loadingStatusText.textContent = "Compressing file (Gzip)...";
+      DOM.loadingProgressBar.style.width = '40%';
+      DOM.loadingPercentageText.textContent = '40%';
+      await new Promise(resolve => setTimeout(resolve, 50));
+
       senderState.dataBuffer = await compressBuffer(senderState.rawBuffer);
       totalDataBytes = senderState.dataBuffer.byteLength;
     } else {
@@ -596,14 +622,15 @@ async function prepareAndStartTransmission() {
   // Pre-render QR codes ONLY if file is small enough to fit in browser cache
   senderState.preRenderedCanvases = [];
   if (totalRawBytes < PRE_RENDER_MAX_SIZE) {
+    DOM.loadingStatusText.textContent = "Pre-rendering QR Codes...";
+    DOM.loadingProgressBar.style.width = '50%';
+    DOM.loadingPercentageText.textContent = '50%';
+
     for (let i = 0; i < totalChunks; i++) {
-      DOM.startSendBtn.innerHTML = `
-        <svg class="animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:16px;height:16px;margin-right:8px;animation: spin 1s linear infinite;">
-          <circle cx="12" cy="12" r="10" stroke-opacity="0.25"/>
-          <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>
-        </svg>
-        Generating QR ${i + 1} / ${totalChunks}...
-      `;
+      const percent = 50 + Math.floor((i / totalChunks) * 45); // Scale from 50% to 95%
+      DOM.loadingProgressBar.style.width = `${percent}%`;
+      DOM.loadingPercentageText.textContent = `${percent}%`;
+      DOM.loadingStatusText.textContent = `Pre-rendering QR Codes (${i + 1}/${totalChunks})...`;
       
       await new Promise(resolve => setTimeout(resolve, 0));
 
@@ -622,9 +649,22 @@ async function prepareAndStartTransmission() {
       });
       senderState.preRenderedCanvases.push(offscreen);
     }
+  } else {
+    // Large files read on the fly
+    DOM.loadingStatusText.textContent = "Configuring dynamic reader...";
+    DOM.loadingProgressBar.style.width = '95%';
+    DOM.loadingPercentageText.textContent = '95%';
+    await new Promise(resolve => setTimeout(resolve, 300));
   }
 
+  // Visual success hold before transitioning
+  DOM.loadingStatusText.textContent = "Ready!";
+  DOM.loadingProgressBar.style.width = '100%';
+  DOM.loadingPercentageText.textContent = '100%';
+  await new Promise(resolve => setTimeout(resolve, 200));
+
   // Transition UI
+  DOM.loadingOverlay.classList.add('hidden');
   DOM.sendConfigPanel.classList.add('hidden');
   DOM.activeSendScreen.classList.remove('hidden');
 
