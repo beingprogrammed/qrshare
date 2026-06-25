@@ -182,11 +182,11 @@
             <!-- Progress stats -->
             <div class="progress-details">
               <div class="progress-info-row">
-                <span>Frame Progress</span>
+                <span>Frame Progress (Drag to Scrub)</span>
                 <span id="txtSendProgress">0 / 0</span>
               </div>
-              <div class="progress-bar-bg">
-                <div class="progress-bar-fill" id="sendProgressBar" style="width: 0%"></div>
+              <div class="progress-slider-container" style="margin: 4px 0 8px 0; display: flex; align-items: center;">
+                <input type="range" id="sendProgressSlider" min="1" max="100" value="1" class="slider" style="cursor: pointer;">
               </div>
               
               <div class="stats-grid">

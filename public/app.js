@@ -82,7 +82,7 @@ const DOM = {
   playPauseBtn: document.getElementById('playPauseBtn'),
   playPauseIcon: document.getElementById('playPauseIcon'),
   txtSendProgress: document.getElementById('txtSendProgress'),
-  sendProgressBar: document.getElementById('sendProgressBar'),
+  sendProgressSlider: document.getElementById('sendProgressSlider'),
   stopSendBtn: document.getElementById('stopSendBtn'),
   statSendChunkSize: document.getElementById('statSendChunkSize'),
   statSendTotalBytes: document.getElementById('statSendTotalBytes'),
@@ -448,16 +448,23 @@ function initSendControls() {
 
   // Playback Control Triggers
   DOM.prevChunkBtn.addEventListener('click', () => {
-    senderState.activeIndex = (senderState.activeIndex - 1 + senderState.chunks.length) % senderState.chunks.length;
+    senderState.activeIndex = (senderState.activeIndex - 1 + senderState.totalChunks) % senderState.totalChunks;
     renderSenderFrame();
   });
 
   DOM.nextChunkBtn.addEventListener('click', () => {
-    senderState.activeIndex = (senderState.activeIndex + 1) % senderState.chunks.length;
+    senderState.activeIndex = (senderState.activeIndex + 1) % senderState.totalChunks;
     if (senderState.activeIndex === 0) {
       senderState.loopCount++;
       DOM.sendLoopIndicator.textContent = `Loop ${senderState.loopCount}`;
     }
+    renderSenderFrame();
+  });
+
+  // Progress Slider scrubbing
+  DOM.sendProgressSlider.addEventListener('input', (e) => {
+    const targetIndex = parseInt(e.target.value) - 1;
+    senderState.activeIndex = targetIndex;
     renderSenderFrame();
   });
 
@@ -619,6 +626,11 @@ async function prepareAndStartTransmission() {
   const totalSeconds = Math.ceil(totalChunks / senderState.fps);
   DOM.statSendEstTime.textContent = `${totalSeconds}s`;
 
+  // Configure Progress Slider bounds
+  DOM.sendProgressSlider.min = 1;
+  DOM.sendProgressSlider.max = totalChunks;
+  DOM.sendProgressSlider.value = 1;
+
   // Pre-render QR codes ONLY if file is small enough to fit in browser cache
   senderState.preRenderedCanvases = [];
   if (totalRawBytes < PRE_RENDER_MAX_SIZE) {
@@ -717,7 +729,7 @@ async function renderSenderFrame() {
   const currNum = senderState.activeIndex + 1;
   const totalNum = senderState.totalChunks;
   DOM.txtSendProgress.textContent = `Frame ${currNum} / ${totalNum}`;
-  DOM.sendProgressBar.style.width = `${(currNum / totalNum) * 100}%`;
+  DOM.sendProgressSlider.value = currNum;
 }
 
 /**
