@@ -123,6 +123,7 @@ document.addEventListener('DOMContentLoaded', () => {
   initDragAndDrop();
   initSendControls();
   initReceiveControls();
+  initWebRTCControls();
 });
 
 // --- Helper Functions ---
@@ -418,6 +419,12 @@ function initSendControls() {
   // Start Transmission Button
   DOM.startSendBtn.addEventListener('click', async () => {
     if (!senderState.file) return;
+    
+    const isP2P = document.getElementById('modeP2P').checked;
+    if (isP2P) {
+      startWebRTCSend();
+      return;
+    }
     
     DOM.startSendBtn.disabled = true;
     DOM.startSendBtn.innerHTML = `
@@ -1028,6 +1035,17 @@ function scanVideoFrame() {
  * Process text string extracted from QR Code
  */
 function handleFrameScanned(dataStr) {
+  // Check for WebRTC Connection Offer first
+  if (dataStr.startsWith('WO|')) {
+    const parts = dataStr.split('|');
+    if (parts.length === 3) {
+      const fileId = parts[1];
+      const compressedSDP = parts[2];
+      handleWebRTCOfferScanned(fileId, compressedSDP);
+    }
+    return;
+  }
+
   // Protocol: MAGIC|Version|FileID|Flags|TotalChunks|Index|Base64Payload|Checksum
   const parts = dataStr.split('|');
   
@@ -1247,3 +1265,820 @@ function triggerFileDownload() {
     document.body.removeChild(a);
   }
 }
+
+// ================= WEBRTC IMPLEMENTATION =================
+
+const webrtcState = {
+  peerConnection: null,
+  dataChannel: null,
+  role: null, // 'sender' or 'receiver'
+  localSDP: "",
+  remoteSDP: "",
+  scannerActive: false,
+  scannerStream: null,
+  scannerAnimationFrameId: null,
+  
+  // Buffers for receiving
+  receivedBuffers: [],
+  receivedMetadata: null,
+
+  // Stats
+  bytesTransferred: 0,
+  totalBytes: 0,
+  startTime: null,
+  speedIntervalId: null,
+  lastBytes: 0
+};
+
+/**
+ * Initialize WebRTC UI options and wire up cancel/stop buttons.
+ */
+function initWebRTCControls() {
+  initTransferModeSelector();
+
+  // Cancel Buttons
+  document.getElementById('cancelP2pSendBtn').addEventListener('click', resetP2PSendUI);
+  document.getElementById('cancelP2pRecvBtn').addEventListener('click', resetP2PReceiveUI);
+  document.getElementById('stopWebrtcSendBtn').addEventListener('click', resetP2PSendUI);
+  document.getElementById('stopWebrtcRecvBtn').addEventListener('click', resetP2PReceiveUI);
+}
+
+/**
+ * Wire up the selector radios for visual stream vs WebRTC.
+ */
+function initTransferModeSelector() {
+  const modeVisual = document.getElementById('modeVisual');
+  const modeP2P = document.getElementById('modeP2P');
+  const modeVisualLabel = document.getElementById('modeVisualLabel');
+  const modeP2PLabel = document.getElementById('modeP2PLabel');
+  const visualSettingsGroup = document.getElementById('visualSettingsGroup');
+
+  const updateModeUI = () => {
+    if (modeVisual.checked) {
+      modeVisualLabel.classList.add('active');
+      modeP2PLabel.classList.remove('active');
+      visualSettingsGroup.classList.remove('hidden');
+      DOM.startSendBtn.innerHTML = `
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:18px;height:18px;margin-right:8px;">
+          <polygon points="5 3 19 12 5 21 5 3" fill="currentColor"/>
+        </svg>
+        Generate QR Sequence & Start
+      `;
+    } else {
+      modeVisualLabel.classList.remove('active');
+      modeP2PLabel.classList.add('active');
+      visualSettingsGroup.classList.add('hidden');
+      DOM.startSendBtn.innerHTML = `
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:18px;height:18px;margin-right:8px;">
+          <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" fill="currentColor"/>
+        </svg>
+        Initialize P2P Transfer
+      `;
+    }
+  };
+
+  modeVisual.addEventListener('change', updateModeUI);
+  modeP2P.addEventListener('change', updateModeUI);
+  
+  modeVisualLabel.addEventListener('click', () => {
+    modeVisual.checked = true;
+    updateModeUI();
+  });
+  modeP2PLabel.addEventListener('click', () => {
+    modeP2P.checked = true;
+    updateModeUI();
+  });
+}
+
+/**
+ * SDP Compression Helpers using existing CompressionStream Gzip
+ */
+async function compressSDP(sdpText) {
+  const encoder = new TextEncoder();
+  const bytes = encoder.encode(sdpText);
+  const compressed = await compressBuffer(bytes);
+  return bytesToBase64(compressed);
+}
+
+async function decompressSDP(base64) {
+  const bytes = base64ToBytes(base64);
+  const decompressed = await decompressBuffer(bytes);
+  const decoder = new TextDecoder();
+  return decoder.decode(decompressed);
+}
+
+/**
+ * Strip SDP text of extra attributes to keep it small enough for QR
+ */
+function optimizeSDP(sdp) {
+  return sdp.split('\n')
+    .map(line => line.trim())
+    .filter(line => {
+      if (!line) return false;
+      if (line.startsWith('a=extmap:')) return false;
+      if (line.startsWith('a=rtcp:')) return false;
+      if (line.startsWith('a=rtcp-fb:')) return false;
+      if (line.startsWith('a=msid:')) return false;
+      if (line.startsWith('a=ssrc:')) return false;
+      if (line.startsWith('a=group:')) return false;
+      if (line.startsWith('a=candidate:')) {
+        // Keep host candidates (local network), drop server reflexive or relay
+        return line.includes('typ host');
+      }
+      return true;
+    })
+    .join('\r\n');
+}
+
+/**
+ * WebRTC P2P - Sender Entry Point
+ */
+async function startWebRTCSend() {
+  if (!senderState.file) return;
+
+  // Set fileId and prepare UI
+  senderState.fileId = generateFileId();
+  DOM.sendConfigPanel.classList.add('hidden');
+  
+  const webrtcSendHandshake = document.getElementById('webrtcSendHandshake');
+  webrtcSendHandshake.classList.remove('hidden');
+  
+  const p2pSendStatus = document.getElementById('p2pSendStatus');
+  p2pSendStatus.textContent = "Generating SDP Offer...";
+  p2pSendStatus.className = "badge badge-pulse";
+
+  // Hide step 2 camera at start
+  const p2pSendStep2 = document.getElementById('p2pSendStep2');
+  p2pSendStep2.classList.add('hidden');
+  document.getElementById('p2pSendStep1').classList.remove('hidden');
+
+  try {
+    webrtcState.role = 'sender';
+    
+    // Create RTCPeerConnection (offline data channel, no STUN/TURN servers)
+    webrtcState.peerConnection = new RTCPeerConnection({
+      iceServers: []
+    });
+
+    webrtcState.peerConnection.onconnectionstatechange = handleP2PConnectionStateChange;
+
+    // Create Data Channel
+    webrtcState.dataChannel = webrtcState.peerConnection.createDataChannel("file-transfer", {
+      ordered: true
+    });
+    setupSenderDataChannel();
+
+    // Create Local Offer SDP
+    const offer = await webrtcState.peerConnection.createOffer();
+    await webrtcState.peerConnection.setLocalDescription(offer);
+
+    // Wait for ICE candidate gathering (Vanilla ICE)
+    await new Promise((resolve) => {
+      if (webrtcState.peerConnection.iceGatheringState === 'complete') {
+        resolve();
+      } else {
+        const checkState = () => {
+          if (webrtcState.peerConnection.iceGatheringState === 'complete') {
+            webrtcState.peerConnection.removeEventListener('icegatheringstatechange', checkState);
+            resolve();
+          }
+        };
+        webrtcState.peerConnection.addEventListener('icegatheringstatechange', checkState);
+        // Safety timeout
+        setTimeout(() => {
+          webrtcState.peerConnection.removeEventListener('icegatheringstatechange', checkState);
+          resolve();
+        }, 3000);
+      }
+    });
+
+    // Compress SDP and display QR code
+    const optimizedOfferSDP = optimizeSDP(webrtcState.peerConnection.localDescription.sdp);
+    const compressedOfferSDP = await compressSDP(optimizedOfferSDP);
+    
+    const qrPayload = `WO|${senderState.fileId}|${compressedOfferSDP}`;
+    
+    await new Promise((resolve, reject) => {
+      QRCode.toCanvas(document.getElementById('webrtcOfferCanvas'), qrPayload, {
+        width: 240,
+        margin: 1,
+        color: { dark: '#000000', light: '#ffffff' },
+        errorCorrectionLevel: 'L'
+      }, (err) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+
+    p2pSendStatus.textContent = "SDP Offer QR Ready";
+    p2pSendStatus.className = "badge";
+
+    // Show Step 2 (camera input to scan receiver's Answer QR)
+    p2pSendStep2.classList.remove('hidden');
+    startWebRTCSenderScanner();
+
+  } catch (err) {
+    console.error("WebRTC sender setup failed:", err);
+    alert("WebRTC setup error: " + err.message);
+    resetP2PSendUI();
+  }
+}
+
+/**
+ * Sender camera loop to scan Receiver SDP Answer QR
+ */
+async function startWebRTCSenderScanner() {
+  if (webrtcState.scannerStream) {
+    stopWebRTCSenderScanner();
+  }
+
+  const constraints = {
+    audio: false,
+    video: {
+      facingMode: 'environment', // back camera
+      width: { ideal: 1280 },
+      height: { ideal: 720 }
+    }
+  };
+
+  try {
+    webrtcState.scannerStream = await navigator.mediaDevices.getUserMedia(constraints);
+    const video = document.getElementById('webrtcSenderVideo');
+    video.srcObject = webrtcState.scannerStream;
+    
+    document.getElementById('webrtcSenderFeedback').textContent = "Camera active. Point at receiver's Answer QR...";
+    document.getElementById('webrtcSenderFeedback').style.color = "var(--color-primary)";
+
+    webrtcState.scannerActive = true;
+    webrtcState.scannerAnimationFrameId = requestAnimationFrame(scanWebRTCSenderFrame);
+  } catch (err) {
+    console.error("Sender Answer scanner start error:", err);
+    document.getElementById('webrtcSenderFeedback').textContent = "Webcam error: " + err.message;
+    document.getElementById('webrtcSenderFeedback').style.color = "var(--color-danger)";
+  }
+}
+
+function stopWebRTCSenderScanner() {
+  webrtcState.scannerActive = false;
+  if (webrtcState.scannerStream) {
+    webrtcState.scannerStream.getTracks().forEach(track => track.stop());
+    webrtcState.scannerStream = null;
+  }
+  if (webrtcState.scannerAnimationFrameId) {
+    cancelAnimationFrame(webrtcState.scannerAnimationFrameId);
+    webrtcState.scannerAnimationFrameId = null;
+  }
+  const video = document.getElementById('webrtcSenderVideo');
+  if (video) video.srcObject = null;
+}
+
+const sendCapCanvas = document.createElement('canvas');
+const sendCapCtx = sendCapCanvas.getContext('2d', { willReadFrequently: true });
+
+async function scanWebRTCSenderFrame() {
+  if (!webrtcState.scannerActive) return;
+
+  const video = document.getElementById('webrtcSenderVideo');
+  if (video && video.readyState === video.HAVE_ENOUGH_DATA && video.videoWidth > 0 && video.videoHeight > 0) {
+    try {
+      sendCapCanvas.width = video.videoWidth;
+      sendCapCanvas.height = video.videoHeight;
+      sendCapCtx.drawImage(video, 0, 0, sendCapCanvas.width, sendCapCanvas.height);
+      const imgData = sendCapCtx.getImageData(0, 0, sendCapCanvas.width, sendCapCanvas.height);
+      
+      const decoded = jsQR(imgData.data, imgData.width, imgData.height);
+      
+      if (decoded && decoded.data && decoded.data.startsWith('WA|')) {
+        const parts = decoded.data.split('|');
+        if (parts.length === 3) {
+          const fileId = parts[1];
+          const compressedSDP = parts[2];
+          
+          if (fileId === senderState.fileId) {
+            stopWebRTCSenderScanner();
+            document.getElementById('webrtcSenderFeedback').textContent = "SDP Answer scanned successfully!";
+            document.getElementById('webrtcSenderFeedback').style.color = "var(--color-success)";
+            playBeep('normal');
+            
+            // Set remote description
+            const answerSDPText = await decompressSDP(compressedSDP);
+            await webrtcState.peerConnection.setRemoteDescription(new RTCSessionDescription({
+              type: 'answer',
+              sdp: answerSDPText
+            }));
+            return;
+          }
+        }
+      }
+    } catch (err) {
+      console.error("Sender scan frame decode error:", err);
+    }
+  }
+
+  if (webrtcState.scannerActive) {
+    webrtcState.scannerAnimationFrameId = requestAnimationFrame(scanWebRTCSenderFrame);
+  }
+}
+
+/**
+ * WebRTC P2P - Receiver SDP Offer Hook (Triggered when Offer QR is scanned)
+ */
+async function handleWebRTCOfferScanned(fileId, compressedSDP) {
+  // Stop normal scanner camera
+  stopReceiverCamera();
+  
+  // Transition UI to Receiver Handshake Panel
+  DOM.activeReceiveScreen.classList.add('hidden');
+  DOM.receiveStartScreen.classList.add('hidden');
+  
+  const webrtcRecvHandshake = document.getElementById('webrtcRecvHandshake');
+  webrtcRecvHandshake.classList.remove('hidden');
+
+  const p2pRecvStatus = document.getElementById('p2pRecvStatus');
+  p2pRecvStatus.textContent = "Processing SDP Offer...";
+  p2pRecvStatus.className = "badge badge-pulse";
+
+  try {
+    webrtcState.role = 'receiver';
+    
+    // Create RTCPeerConnection (offline data channel, no STUN/TURN servers)
+    webrtcState.peerConnection = new RTCPeerConnection({
+      iceServers: []
+    });
+
+    webrtcState.peerConnection.onconnectionstatechange = handleP2PConnectionStateChange;
+    webrtcState.peerConnection.ondatachannel = (event) => {
+      webrtcState.dataChannel = event.channel;
+      setupReceiverDataChannel();
+    };
+
+    // Set remote description (SDP Offer)
+    const offerSDPText = await decompressSDP(compressedSDP);
+    await webrtcState.peerConnection.setRemoteDescription(new RTCSessionDescription({
+      type: 'offer',
+      sdp: offerSDPText
+    }));
+
+    // Create SDP Answer
+    const answer = await webrtcState.peerConnection.createAnswer();
+    await webrtcState.peerConnection.setLocalDescription(answer);
+
+    // Wait for ICE gathering (Vanilla ICE)
+    await new Promise((resolve) => {
+      if (webrtcState.peerConnection.iceGatheringState === 'complete') {
+        resolve();
+      } else {
+        const checkState = () => {
+          if (webrtcState.peerConnection.iceGatheringState === 'complete') {
+            webrtcState.peerConnection.removeEventListener('icegatheringstatechange', checkState);
+            resolve();
+          }
+        };
+        webrtcState.peerConnection.addEventListener('icegatheringstatechange', checkState);
+        setTimeout(() => {
+          webrtcState.peerConnection.removeEventListener('icegatheringstatechange', checkState);
+          resolve();
+        }, 3000);
+      }
+    });
+
+    // Compress SDP Answer and display Answer QR
+    const optimizedAnswerSDP = optimizeSDP(webrtcState.peerConnection.localDescription.sdp);
+    const compressedAnswerSDP = await compressSDP(optimizedAnswerSDP);
+    
+    const qrPayload = `WA|${fileId}|${compressedAnswerSDP}`;
+    
+    await new Promise((resolve, reject) => {
+      QRCode.toCanvas(document.getElementById('webrtcAnswerCanvas'), qrPayload, {
+        width: 240,
+        margin: 1,
+        color: { dark: '#000000', light: '#ffffff' },
+        errorCorrectionLevel: 'L'
+      }, (err) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+
+    p2pRecvStatus.textContent = "SDP Answer QR Ready";
+    p2pRecvStatus.className = "badge";
+
+  } catch (err) {
+    console.error("WebRTC receiver setup failed:", err);
+    alert("WebRTC setup error: " + err.message);
+    resetP2PReceiveUI();
+  }
+}
+
+/**
+ * Configure data channel for sender (Upload)
+ */
+function setupSenderDataChannel() {
+  const dc = webrtcState.dataChannel;
+  dc.binaryType = "arraybuffer";
+  
+  dc.onopen = () => {
+    console.log("Data channel opened on sender!");
+    startWebRTCTransfer();
+  };
+  
+  dc.onclose = () => {
+    console.log("Data channel closed on sender!");
+    closeWebRTCConnection();
+  };
+  
+  dc.onerror = (err) => {
+    console.error("Data channel error on sender:", err);
+  };
+}
+
+/**
+ * Transition sender UI and start file packet transmission loop
+ */
+function startWebRTCTransfer() {
+  document.getElementById('webrtcSendHandshake').classList.add('hidden');
+  
+  const webrtcActiveSendScreen = document.getElementById('webrtcActiveSendScreen');
+  webrtcActiveSendScreen.classList.remove('hidden');
+
+  document.getElementById('webrtcSendTitle').textContent = senderState.file.name;
+  
+  const sendStatus = document.getElementById('webrtcSendStatusBadge');
+  sendStatus.textContent = "Transferring";
+  sendStatus.className = "badge badge-pulse";
+
+  sendWebRTCFileData();
+}
+
+/**
+ * Sender packet transmission loop (supports files up to 2GB with backpressure throttling)
+ */
+async function sendWebRTCFileData() {
+  const file = senderState.file;
+  if (!file) return;
+
+  const dc = webrtcState.dataChannel;
+  if (!dc || dc.readyState !== 'open') return;
+
+  webrtcState.totalBytes = file.size;
+  webrtcState.bytesTransferred = 0;
+  webrtcState.startTime = Date.now();
+  webrtcState.lastBytes = 0;
+
+  // Send metadata JSON block first
+  const metadataMsg = `METADATA:${JSON.stringify({
+    name: file.name,
+    size: file.size,
+    type: file.type || "application/octet-stream"
+  })}`;
+  dc.send(metadataMsg);
+
+  // Start Speed tracker
+  startSpeedInterval('sender');
+
+  try {
+    const chunkSize = 65536; // 64 KB chunks
+    let offset = 0;
+    const BUFFER_THRESHOLD = 1048576; // 1 MB buffer limit
+    dc.bufferedAmountLowThreshold = BUFFER_THRESHOLD / 2;
+
+    const readSlice = (start, end) => {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(reader.error);
+        reader.readAsArrayBuffer(file.slice(start, end));
+      });
+    };
+
+    while (offset < file.size && dc.readyState === 'open') {
+      // Manage backpressure: if data channel buffer exceeds 1MB, wait for it to clear
+      if (dc.bufferedAmount > BUFFER_THRESHOLD) {
+        await new Promise((resolve) => {
+          const onBufferedAmountLow = () => {
+            dc.removeEventListener('bufferedamountlow', onBufferedAmountLow);
+            resolve();
+          };
+          dc.addEventListener('bufferedamountlow', onBufferedAmountLow);
+        });
+      }
+
+      const end = Math.min(offset + chunkSize, file.size);
+      const buffer = await readSlice(offset, end);
+      dc.send(buffer);
+      
+      offset = end;
+      webrtcState.bytesTransferred = offset;
+
+      updateSenderProgressUI();
+    }
+
+    if (dc.readyState === 'open') {
+      // Signal transfer completeness
+      dc.send("EOF");
+      console.log("File sent completely over WebRTC!");
+      
+      const sendStatus = document.getElementById('webrtcSendStatusBadge');
+      sendStatus.textContent = "Complete";
+      sendStatus.className = "badge";
+      
+      document.getElementById('webrtcSendProgressText').textContent = "100%";
+      document.getElementById('webrtcSendProgressBar').style.width = "100%";
+      
+      stopSpeedInterval();
+      playBeep('success');
+      
+      alert(`Successfully sent ${file.name}!`);
+      
+      setTimeout(() => {
+        resetP2PSendUI();
+      }, 3000);
+    }
+  } catch (err) {
+    console.error("WebRTC send loop error:", err);
+    alert("Error transferring file: " + err.message);
+    resetP2PSendUI();
+  }
+}
+
+/**
+ * Configure data channel for receiver (Download)
+ */
+function setupReceiverDataChannel() {
+  const dc = webrtcState.dataChannel;
+  dc.binaryType = "arraybuffer";
+  
+  webrtcState.receivedBuffers = [];
+  webrtcState.receivedMetadata = null;
+  receiverState.isComplete = false;
+
+  dc.onopen = () => {
+    console.log("Data channel opened on receiver!");
+    
+    // Switch to downloading active screen
+    document.getElementById('webrtcRecvStatusBadge').textContent = "Transferring";
+    document.getElementById('webrtcRecvStatusBadge').className = "badge badge-pulse";
+    document.getElementById('webrtcRecvProgressText').textContent = "0%";
+    document.getElementById('webrtcRecvProgressBar').style.width = "0%";
+    
+    document.getElementById('webrtcRecvSpeed').textContent = "0 B/s";
+    document.getElementById('webrtcRecvBytes').textContent = "0 B";
+    document.getElementById('webrtcRecvEstTime').textContent = "--";
+    document.getElementById('webrtcRecvTitle').textContent = "Connecting...";
+
+    document.getElementById('webrtcRecvHandshake').classList.add('hidden');
+    document.getElementById('webrtcActiveRecvScreen').classList.remove('hidden');
+    
+    webrtcState.bytesTransferred = 0;
+    webrtcState.totalBytes = 0;
+    webrtcState.startTime = Date.now();
+    webrtcState.lastBytes = 0;
+    
+    startSpeedInterval('receiver');
+  };
+
+  dc.onmessage = async (event) => {
+    const data = event.data;
+
+    if (typeof data === "string") {
+      if (data.startsWith("METADATA:")) {
+        try {
+          const metaStr = data.substring(9);
+          webrtcState.receivedMetadata = JSON.parse(metaStr);
+          webrtcState.totalBytes = webrtcState.receivedMetadata.size;
+          
+          document.getElementById('webrtcRecvTitle').textContent = webrtcState.receivedMetadata.name;
+          document.getElementById('webrtcRecvTotalBytes').textContent = formatBytes(webrtcState.receivedMetadata.size);
+          console.log("Received metadata:", webrtcState.receivedMetadata);
+        } catch (err) {
+          console.error("Error parsing P2P metadata:", err);
+        }
+      } else if (data === "EOF") {
+        console.log("EOF received via WebRTC!");
+        stopSpeedInterval();
+        await assembleAndDownloadP2P();
+      }
+    } else {
+      // Accumulate binary buffer slice
+      webrtcState.receivedBuffers.push(new Uint8Array(data));
+      webrtcState.bytesTransferred += data.byteLength;
+      
+      updateReceiverProgressUI();
+      
+      // Auto assembly fallback if size match
+      if (webrtcState.totalBytes > 0 && webrtcState.bytesTransferred >= webrtcState.totalBytes) {
+        stopSpeedInterval();
+        await assembleAndDownloadP2P();
+      }
+    }
+  };
+
+  dc.onclose = () => {
+    console.log("Data channel closed on receiver!");
+    closeWebRTCConnection();
+  };
+}
+
+/**
+ * Reassemble received packets in RAM, compute Adler32, and trigger dynamic file download
+ */
+async function assembleAndDownloadP2P() {
+  if (receiverState.isComplete) return;
+  receiverState.isComplete = true;
+
+  try {
+    document.getElementById('webrtcRecvTitle').textContent = "Assembling file...";
+    
+    // Allocate buffer size
+    const combinedBytes = new Uint8Array(webrtcState.bytesTransferred);
+    let offset = 0;
+    for (const chunk of webrtcState.receivedBuffers) {
+      combinedBytes.set(chunk, offset);
+      offset += chunk.length;
+    }
+
+    const metadata = webrtcState.receivedMetadata;
+    const mimeType = metadata ? metadata.type : "application/octet-stream";
+    const fileName = metadata ? metadata.name : "p2p_file.bin";
+    const fileBlob = new Blob([combinedBytes], { type: mimeType });
+
+    // Store Blob locally for download
+    receiverState.downloadUrl = URL.createObjectURL(fileBlob);
+    receiverState.downloadName = fileName;
+
+    // Adler32 verification code
+    const rawDataString = bytesToBase64(combinedBytes);
+    const integrityHash = adler32(rawDataString).toString(16).toUpperCase();
+
+    // Fill success panel data
+    DOM.successFileName.textContent = fileName;
+    DOM.successFileSize.textContent = formatBytes(combinedBytes.byteLength);
+    DOM.successFileType.textContent = mimeType;
+    DOM.successFileHash.textContent = `ADLER32:${integrityHash}`;
+
+    // Display success screen
+    document.getElementById('webrtcActiveRecvScreen').classList.add('hidden');
+    DOM.recvSuccessScreen.classList.remove('hidden');
+
+    playBeep('success');
+    closeWebRTCConnection();
+    
+    // Trigger download
+    triggerFileDownload();
+
+  } catch (err) {
+    console.error("P2P Assembly failed:", err);
+    alert("Error reconstructing P2P file data: " + err.message);
+    resetP2PReceiveUI();
+  }
+}
+
+/**
+ * Progress UI calculation updates
+ */
+function updateSenderProgressUI() {
+  const transferred = webrtcState.bytesTransferred;
+  const total = webrtcState.totalBytes;
+  if (!total) return;
+  const percent = Math.min(100, Math.floor((transferred / total) * 100));
+  
+  document.getElementById('webrtcSendProgressText').textContent = `${percent}%`;
+  document.getElementById('webrtcSendProgressBar').style.width = `${percent}%`;
+  document.getElementById('webrtcSendBytes').textContent = formatBytes(transferred);
+}
+
+function updateReceiverProgressUI() {
+  const transferred = webrtcState.bytesTransferred;
+  const total = webrtcState.totalBytes;
+  if (!total) return;
+  const percent = Math.min(100, Math.floor((transferred / total) * 100));
+
+  document.getElementById('webrtcRecvProgressText').textContent = `${percent}%`;
+  document.getElementById('webrtcRecvProgressBar').style.width = `${percent}%`;
+  document.getElementById('webrtcRecvBytes').textContent = formatBytes(transferred);
+}
+
+/**
+ * High speed measurement and Time Remaining tracker
+ */
+function startSpeedInterval(role) {
+  stopSpeedInterval();
+  
+  webrtcState.lastBytes = 0;
+  webrtcState.speedIntervalId = setInterval(() => {
+    const elapsed = (Date.now() - webrtcState.startTime) / 1000;
+    if (elapsed <= 0) return;
+    
+    const bytesTransferred = webrtcState.bytesTransferred;
+    const bytesDiff = bytesTransferred - webrtcState.lastBytes;
+    webrtcState.lastBytes = bytesTransferred;
+    
+    const speedBytesPerSec = bytesDiff; 
+    const speedFormatted = formatBytes(speedBytesPerSec) + "/s";
+    
+    const remainingBytes = webrtcState.totalBytes - bytesTransferred;
+    let etaFormatted = "--";
+    if (speedBytesPerSec > 0) {
+      const etaSeconds = Math.ceil(remainingBytes / speedBytesPerSec);
+      etaFormatted = etaSeconds + "s";
+    }
+
+    if (role === 'sender') {
+      document.getElementById('webrtcSendSpeed').textContent = speedFormatted;
+      document.getElementById('webrtcSendBytes').textContent = formatBytes(bytesTransferred);
+      document.getElementById('webrtcSendEstTime').textContent = etaFormatted;
+    } else {
+      document.getElementById('webrtcRecvSpeed').textContent = speedFormatted;
+      document.getElementById('webrtcRecvBytes').textContent = formatBytes(bytesTransferred);
+      document.getElementById('webrtcRecvEstTime').textContent = etaFormatted;
+    }
+  }, 1000);
+}
+
+function stopSpeedInterval() {
+  if (webrtcState.speedIntervalId) {
+    clearInterval(webrtcState.speedIntervalId);
+    webrtcState.speedIntervalId = null;
+  }
+}
+
+/**
+ * Handle connection changes
+ */
+function handleP2PConnectionStateChange() {
+  const pc = webrtcState.peerConnection;
+  if (!pc) return;
+
+  const state = pc.connectionState;
+  console.log("P2P Connection State:", state);
+
+  const sendStatus = document.getElementById('webrtcSendStatusBadge');
+  const recvStatus = document.getElementById('webrtcRecvStatusBadge');
+
+  if (state === 'connected') {
+    if (webrtcState.role === 'sender') {
+      if (sendStatus) sendStatus.textContent = "Connected";
+    } else {
+      if (recvStatus) recvStatus.textContent = "Connected";
+    }
+  } else if (state === 'failed' || state === 'disconnected') {
+    console.warn("P2P connection lost!");
+    if (webrtcState.role === 'sender') {
+      alert("P2P connection failed or disconnected.");
+      resetP2PSendUI();
+    } else {
+      alert("P2P connection failed or disconnected.");
+      resetP2PReceiveUI();
+    }
+  }
+}
+
+/**
+ * Reset functions and channel / connection tear down
+ */
+function closeWebRTCConnection() {
+  stopSpeedInterval();
+  stopWebRTCSenderScanner();
+  
+  if (webrtcState.dataChannel) {
+    try {
+      webrtcState.dataChannel.close();
+    } catch(e){}
+    webrtcState.dataChannel = null;
+  }
+  if (webrtcState.peerConnection) {
+    try {
+      webrtcState.peerConnection.close();
+    } catch(e){}
+    webrtcState.peerConnection = null;
+  }
+}
+
+function resetP2PSendUI() {
+  closeWebRTCConnection();
+  
+  document.getElementById('webrtcSendHandshake').classList.add('hidden');
+  document.getElementById('webrtcActiveSendScreen').classList.add('hidden');
+  DOM.sendConfigPanel.classList.remove('hidden');
+  DOM.startSendBtn.disabled = false;
+  
+  const isP2P = document.getElementById('modeP2P').checked;
+  if (isP2P) {
+    DOM.startSendBtn.innerHTML = `
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:18px;height:18px;margin-right:8px;">
+        <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" fill="currentColor"/>
+      </svg>
+      Initialize P2P Transfer
+    `;
+  }
+}
+
+function resetP2PReceiveUI() {
+  closeWebRTCConnection();
+  
+  document.getElementById('webrtcRecvHandshake').classList.add('hidden');
+  document.getElementById('webrtcActiveRecvScreen').classList.add('hidden');
+  DOM.receiveStartScreen.classList.remove('hidden');
+  resetReceiverState();
+}
+
