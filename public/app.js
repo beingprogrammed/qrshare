@@ -20,7 +20,9 @@ const senderState = {
   fileId: "",
   chunks: [],
   preRenderedCanvases: [], // Cache for pre-rendered offscreen canvases
-  intervalId: null,
+  totalChunks: 0,
+  metadataFrame: "",
+  timeoutId: null, // timeout identifier for adaptive playback
   activeIndex: 0,
   isPlaying: false,
   loopCount: 1
@@ -345,6 +347,41 @@ function handleFileSelected(file) {
   DOM.cfgFileSize.textContent = formatBytes(file.size);
   DOM.cfgFileType.textContent = file.type || "unknown binary mimetype";
   
+  // Dynamic label warning / optimization details based on file size
+  const compressCheckbox = DOM.inputCompress;
+  const compressLabel = compressCheckbox.parentElement;
+  
+  // Clean up any old warnings
+  const oldWarning = document.getElementById('largeFileWarning');
+  if (oldWarning) oldWarning.remove();
+  
+  if (file.size >= 10 * 1024 * 1024) { // >= 10 MB
+    compressCheckbox.checked = false;
+    compressCheckbox.disabled = true;
+    
+    const warning = document.createElement('div');
+    warning.id = 'largeFileWarning';
+    warning.style.color = 'var(--color-warning)';
+    warning.style.fontSize = '11px';
+    warning.style.marginTop = '6px';
+    warning.textContent = '⚠️ Gzip compression disabled for large files (>=10MB) to prevent browser freeze. File will be read dynamically from local storage.';
+    compressLabel.parentElement.appendChild(warning);
+  } else if (file.size >= 500 * 1024) { // >= 500 KB
+    compressCheckbox.checked = true;
+    compressCheckbox.disabled = false;
+    
+    const warning = document.createElement('div');
+    warning.id = 'largeFileWarning';
+    warning.style.color = 'var(--color-primary)';
+    warning.style.fontSize = '11px';
+    warning.style.marginTop = '6px';
+    warning.textContent = '⚡ File >=500KB will be read dynamically from local storage to prevent browser memory issues (no pre-render delay).';
+    compressLabel.parentElement.appendChild(warning);
+  } else {
+    compressCheckbox.checked = true;
+    compressCheckbox.disabled = false;
+  }
+  
   // Show config panel, hide dropzone
   DOM.dropzone.classList.add('hidden');
   DOM.sendConfigPanel.classList.remove('hidden');
@@ -445,6 +482,44 @@ function initSendControls() {
 /**
  * Prepares the file data, divides it into chunks, formats them, and launches the transmitter
  */
+/**
+ * Asynchronously generates the formatted frame text payload for a specific index.
+ * Handles reading slices directly from disk (on-the-fly) to conserve RAM for larger files.
+ */
+async function getSenderFrameText(index) {
+  if (index === 0) {
+    return senderState.metadataFrame;
+  }
+
+  const dataIndex = index - 1;
+  const startByte = dataIndex * senderState.chunkSize;
+  let slicedBytes;
+
+  if (senderState.dataBuffer) {
+    // Read from the preloaded RAM buffer (compressed or raw)
+    const endByte = Math.min(startByte + senderState.chunkSize, senderState.dataBuffer.byteLength);
+    slicedBytes = senderState.dataBuffer.subarray(startByte, endByte);
+  } else {
+    // Read directly from disk using HTML5 File API (0 MB memory overhead)
+    const endByte = Math.min(startByte + senderState.chunkSize, senderState.file.size);
+    const blobSlice = senderState.file.slice(startByte, endByte);
+    
+    const arrayBuffer = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(reader.error);
+      reader.readAsArrayBuffer(blobSlice);
+    });
+    slicedBytes = new Uint8Array(arrayBuffer);
+  }
+
+  const chunkBase64 = bytesToBase64(slicedBytes);
+  const chunkChecksum = adler32(chunkBase64).toString(16).padStart(8, '0');
+  const metaFlag = senderState.isCompressed ? "1" : "0";
+
+  return `${MAGIC_PREFIX}|${PROTOCOL_VERSION}|${senderState.fileId}|${metaFlag}|${senderState.totalChunks}|${index}|${chunkBase64}|${chunkChecksum}`;
+}
+
 async function prepareAndStartTransmission() {
   const file = senderState.file;
   senderState.isCompressed = DOM.inputCompress.checked;
@@ -454,31 +529,43 @@ async function prepareAndStartTransmission() {
   senderState.loopCount = 1;
   DOM.sendLoopIndicator.textContent = `Loop 1`;
 
-  // Read file contents
-  const reader = new FileReader();
-  const fileDataPromise = new Promise((resolve, reject) => {
-    reader.onload = () => resolve(new Uint8Array(reader.result));
-    reader.onerror = () => reject(reader.error);
-  });
-  reader.readAsArrayBuffer(file);
-  senderState.rawBuffer = await fileDataPromise;
+  const totalRawBytes = file.size;
+  let totalDataBytes = totalRawBytes;
+  
+  // File size optimization thresholds
+  const PRE_RENDER_MAX_SIZE = 500 * 1024; // 500 KB
+  const COMPRESS_MAX_SIZE = 10 * 1024 * 1024; // 10 MB
 
-  // Compress if checked
-  if (senderState.isCompressed) {
-    senderState.dataBuffer = await compressBuffer(senderState.rawBuffer);
+  // Auto-disable compression for large files to avoid browser freeze
+  if (totalRawBytes >= COMPRESS_MAX_SIZE) {
+    senderState.isCompressed = false;
+    senderState.rawBuffer = null;
+    senderState.dataBuffer = null;
   } else {
-    senderState.dataBuffer = senderState.rawBuffer;
+    // Read contents into memory only for files that support compression/caching
+    const reader = new FileReader();
+    const fileDataPromise = new Promise((resolve, reject) => {
+      reader.onload = () => resolve(new Uint8Array(reader.result));
+      reader.onerror = () => reject(reader.error);
+    });
+    reader.readAsArrayBuffer(file);
+    senderState.rawBuffer = await fileDataPromise;
+
+    if (senderState.isCompressed) {
+      senderState.dataBuffer = await compressBuffer(senderState.rawBuffer);
+      totalDataBytes = senderState.dataBuffer.byteLength;
+    } else {
+      senderState.dataBuffer = senderState.rawBuffer;
+      totalDataBytes = senderState.rawBuffer.byteLength;
+    }
   }
 
-  // Calculate stats
-  const totalRawBytes = senderState.rawBuffer.byteLength;
-  const totalDataBytes = senderState.dataBuffer.byteLength;
+  // Calculate chunks count
   const dataChunksCount = Math.ceil(totalDataBytes / senderState.chunkSize);
-  const totalChunks = dataChunksCount + 1; // +1 for the Metadata Chunk
+  const totalChunks = dataChunksCount + 1; // +1 for metadata chunk
+  senderState.totalChunks = totalChunks;
 
-  senderState.chunks = [];
-
-  // 1. Create Metadata Chunk (Index 0)
+  // 1. Pre-calculate Metadata Frame (Index 0)
   const metadataObj = {
     name: file.name,
     size: totalRawBytes,
@@ -491,25 +578,13 @@ async function prepareAndStartTransmission() {
   const metadataBase64 = btoa(unescape(encodeURIComponent(metadataStr))); // safe utf-8 base64
   const metaChecksum = adler32(metadataBase64).toString(16).padStart(8, '0');
   
-  // Format: QS|Version|FileID|Flags|TotalChunks|Index|Base64Payload|Checksum
   const metaFlag = senderState.isCompressed ? "1" : "0";
-  const metaFrameText = `${MAGIC_PREFIX}|${PROTOCOL_VERSION}|${senderState.fileId}|${metaFlag}|${totalChunks}|0|${metadataBase64}|${metaChecksum}`;
-  senderState.chunks.push(metaFrameText);
+  senderState.metadataFrame = `${MAGIC_PREFIX}|${PROTOCOL_VERSION}|${senderState.fileId}|${metaFlag}|${totalChunks}|0|${metadataBase64}|${metaChecksum}`;
 
-  // 2. Create Data Chunks (Index 1 to N)
-  for (let i = 0; i < dataChunksCount; i++) {
-    const startByte = i * senderState.chunkSize;
-    const endByte = Math.min(startByte + senderState.chunkSize, totalDataBytes);
-    const slicedBytes = senderState.dataBuffer.subarray(startByte, endByte);
-    const chunkBase64 = bytesToBase64(slicedBytes);
-    const chunkChecksum = adler32(chunkBase64).toString(16).padStart(8, '0');
-    const index = i + 1;
-    
-    const dataFrameText = `${MAGIC_PREFIX}|${PROTOCOL_VERSION}|${senderState.fileId}|${metaFlag}|${totalChunks}|${index}|${chunkBase64}|${chunkChecksum}`;
-    senderState.chunks.push(dataFrameText);
-  }
+  // Reset indices array
+  senderState.chunks = new Array(totalChunks).fill("");
 
-  // Update UI Info
+  // Update UI Stats
   DOM.activeSendTitle.textContent = file.name;
   DOM.statSendChunkSize.textContent = `${senderState.chunkSize} B`;
   DOM.statSendTotalBytes.textContent = formatBytes(totalRawBytes);
@@ -518,61 +593,81 @@ async function prepareAndStartTransmission() {
   const totalSeconds = Math.ceil(totalChunks / senderState.fps);
   DOM.statSendEstTime.textContent = `${totalSeconds}s`;
 
-  // Pre-render all QR codes onto offscreen canvases to ensure fluid, lag-free playback
+  // Pre-render QR codes ONLY if file is small enough to fit in browser cache
   senderState.preRenderedCanvases = [];
-  for (let i = 0; i < totalChunks; i++) {
-    DOM.startSendBtn.innerHTML = `
-      <svg class="animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:16px;height:16px;margin-right:8px;animation: spin 1s linear infinite;">
-        <circle cx="12" cy="12" r="10" stroke-opacity="0.25"/>
-        <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>
-      </svg>
-      Generating QR ${i + 1} / ${totalChunks}...
-    `;
-    
-    // Yield execution back to the browser to redraw the progress text
-    await new Promise(resolve => setTimeout(resolve, 0));
+  if (totalRawBytes < PRE_RENDER_MAX_SIZE) {
+    for (let i = 0; i < totalChunks; i++) {
+      DOM.startSendBtn.innerHTML = `
+        <svg class="animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:16px;height:16px;margin-right:8px;animation: spin 1s linear infinite;">
+          <circle cx="12" cy="12" r="10" stroke-opacity="0.25"/>
+          <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>
+        </svg>
+        Generating QR ${i + 1} / ${totalChunks}...
+      `;
+      
+      await new Promise(resolve => setTimeout(resolve, 0));
 
-    const offscreen = document.createElement('canvas');
-    await new Promise((resolve, reject) => {
-      QRCode.toCanvas(offscreen, senderState.chunks[i], {
-        width: 280,
-        margin: 1,
-        color: {
-          dark: '#000000',
-          light: '#ffffff'
-        },
-        errorCorrectionLevel: 'L'
-      }, (err) => {
-        if (err) reject(err);
-        else resolve();
+      const frameText = await getSenderFrameText(i);
+      const offscreen = document.createElement('canvas');
+      await new Promise((resolve, reject) => {
+        QRCode.toCanvas(offscreen, frameText, {
+          width: 280,
+          margin: 1,
+          color: { dark: '#000000', light: '#ffffff' },
+          errorCorrectionLevel: 'L'
+        }, (err) => {
+          if (err) reject(err);
+          else resolve();
+        });
       });
-    });
-    senderState.preRenderedCanvases.push(offscreen);
+      senderState.preRenderedCanvases.push(offscreen);
+    }
   }
 
-  // Transition UI to sender screen
+  // Transition UI
   DOM.sendConfigPanel.classList.add('hidden');
   DOM.activeSendScreen.classList.remove('hidden');
 
-  // Launch Playback
+  // Start Playback
   senderState.activeIndex = 0;
   playSending();
 }
 
 /**
- * Render current active frame to the canvas
+ * Renders the active frame to the visible canvas.
+ * Draws from offscreen cache if available, or generates the frame on-the-fly.
  */
-function renderSenderFrame() {
-  const activeCanvas = senderState.preRenderedCanvases[senderState.activeIndex];
-  if (!activeCanvas) return;
+async function renderSenderFrame() {
+  const isPreRendered = senderState.preRenderedCanvases.length > 0;
   
-  // Clear and copy the pre-rendered canvas onto the visible canvas instantly
-  const ctx = DOM.qrCanvas.getContext('2d');
-  DOM.qrCanvas.width = activeCanvas.width;
-  DOM.qrCanvas.height = activeCanvas.height;
-  ctx.drawImage(activeCanvas, 0, 0);
+  if (isPreRendered) {
+    const activeCanvas = senderState.preRenderedCanvases[senderState.activeIndex];
+    if (!activeCanvas) return;
+    const ctx = DOM.qrCanvas.getContext('2d');
+    DOM.qrCanvas.width = activeCanvas.width;
+    DOM.qrCanvas.height = activeCanvas.height;
+    ctx.drawImage(activeCanvas, 0, 0);
+  } else {
+    // Generate QR code dynamically in real-time
+    try {
+      const frameText = await getSenderFrameText(senderState.activeIndex);
+      await new Promise((resolve, reject) => {
+        QRCode.toCanvas(DOM.qrCanvas, frameText, {
+          width: 280,
+          margin: 1,
+          color: { dark: '#000000', light: '#ffffff' },
+          errorCorrectionLevel: 'L'
+        }, (err) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+    } catch (err) {
+      console.error("On-the-fly QR generation failed:", err);
+    }
+  }
 
-  // Cycle corners / sync indicator colors to show active frame change clearly
+  // Cycle sync colors / border glow
   const colors = ['#00f2fe', '#4facfe', '#b156ff', '#10b981', '#f59e0b', '#ef4444'];
   const activeColor = colors[senderState.activeIndex % colors.length];
   DOM.qrSyncIndicator.style.backgroundColor = activeColor;
@@ -580,9 +675,33 @@ function renderSenderFrame() {
 
   // Update progress info
   const currNum = senderState.activeIndex + 1;
-  const totalNum = senderState.chunks.length;
+  const totalNum = senderState.totalChunks;
   DOM.txtSendProgress.textContent = `Frame ${currNum} / ${totalNum}`;
   DOM.sendProgressBar.style.width = `${(currNum / totalNum) * 100}%`;
+}
+
+/**
+ * Adaptive execution loop that runs frames at target FPS without overlapping.
+ */
+async function tickSender() {
+  if (!senderState.isPlaying) return;
+
+  const startTime = Date.now();
+  await renderSenderFrame();
+
+  // Increment index
+  senderState.activeIndex = (senderState.activeIndex + 1) % senderState.totalChunks;
+  if (senderState.activeIndex === 0) {
+    senderState.loopCount++;
+    DOM.sendLoopIndicator.textContent = `Loop ${senderState.loopCount}`;
+  }
+
+  // Calculate adaptive delay to keep frame rate stable
+  const elapsed = Date.now() - startTime;
+  const targetDelay = 1000 / senderState.fps;
+  const remainingDelay = Math.max(0, targetDelay - elapsed);
+
+  senderState.timeoutId = setTimeout(tickSender, remainingDelay);
 }
 
 function playSending() {
@@ -595,29 +714,16 @@ function playSending() {
     <rect x="14" y="4" width="4" height="16" fill="currentColor"/>
   `;
 
-  renderSenderFrame();
-
-  const intervalMs = 1000 / senderState.fps;
-  senderState.intervalId = setInterval(() => {
-    senderState.activeIndex = (senderState.activeIndex + 1) % senderState.chunks.length;
-    
-    // Check if looped
-    if (senderState.activeIndex === 0) {
-      senderState.loopCount++;
-      DOM.sendLoopIndicator.textContent = `Loop ${senderState.loopCount}`;
-    }
-    
-    renderSenderFrame();
-  }, intervalMs);
+  tickSender();
 }
 
 function pauseSending() {
   if (!senderState.isPlaying) return;
   senderState.isPlaying = false;
   
-  if (senderState.intervalId) {
-    clearInterval(senderState.intervalId);
-    senderState.intervalId = null;
+  if (senderState.timeoutId) {
+    clearTimeout(senderState.timeoutId);
+    senderState.timeoutId = null;
   }
 
   // Toggle SVG icon to Play
@@ -631,6 +737,8 @@ function stopSending() {
   senderState.activeIndex = 0;
   senderState.chunks = [];
   senderState.preRenderedCanvases = [];
+  senderState.totalChunks = 0;
+  senderState.metadataFrame = "";
   senderState.file = null;
   senderState.rawBuffer = null;
   senderState.dataBuffer = null;
